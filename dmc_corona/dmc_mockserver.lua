@@ -136,6 +136,7 @@ local dmc_utils_data = Utils.extend( dmc_lib_data.dmc_mockserver, DMC_MOCKSERVER
 --====================================================================--
 
 local json = require( "json" )
+local urllib = require( 'socket.url' )
 
 local Objects = require( dmc_lib_func.find('dmc_objects') )
 local Utils = require( dmc_lib_func.find('dmc_utils') )
@@ -152,6 +153,8 @@ local inheritsFrom = Objects.inheritsFrom
 local CoronaBase = Objects.CoronaBase
 
 
+local MockSingleton = nil
+
 
 --====================================================================--
 -- Mock Server Class
@@ -161,9 +164,16 @@ local MockServer = inheritsFrom( CoronaBase )
 MockServer.NAME = "DMC Library Mock Server"
 
 
+--== Class Constants
+
 MockServer.REQUEST_DELAY = 500 -- milliseconds
 
+MockServer.DOWNLOAD = 'download'
+MockServer.REQUEST = 'request'
 
+
+
+--====================================================================--
 --== Start: Setup DMC Objects
 
 
@@ -179,8 +189,10 @@ function MockServer:_init( params )
 	self._base_path = params.base_path
 
 	self._network = _G.network
-	self._filter = nil -- filter function
+	self._filter = nil -- table of filter functions
 	self._actions = nil -- table of possible responses
+
+	self._request_delay = params.delay or self.REQUEST_DELAY
 
 	--== Display Groups ==--
 
@@ -198,11 +210,14 @@ function MockServer:_initComplete()
 	--==--
 
 	self._actions = {}
+	self._filter = {}
 
 	-- setup network.* API on object
+	-- required so we act like object, not module
 	self.request = self:createCallback( self._request )
+	self.download = self:createCallback( self._download )
 
-
+	-- base setup, we accept anything
 	self:addFilter( function( url, method ) return true end )
 
 end
@@ -212,117 +227,342 @@ function MockServer:_undoInitComplete()
 	self:superCall( "_undoInitComplete" )
 end
 
+
 --== END: Setup DMC Objects
+--====================================================================--
 
 
-function MockServer:respondWith( method, url, response )
-	-- print( "MockServer:respondWith", method, url, response )
+
+--====================================================================--
+--== Class API Methods
+
+
+function MockServer.__setters:delay( value )
+	-- print( "MockServer.__setters:delay ", value )
+	self._request_delay = value
+end
+
+
+
+--[[
+
+
+{
+	download={
+		'POST'={
+			{
+				url='',
+				action={}
+			}
+		}
+	}
+
+}
+
+--]]
+
+function MockServer:respondWith( req_type, method, url, response )
+	-- print( "MockServer:respondWith", req_type, method, url, response )
 
 	local resp_hash = self._actions
-	local resp_list
+	local resp_list, item
 
+	-- check for request type, eg 'download'
+	if not resp_hash[ req_type ] then resp_hash[ req_type ] = {} end
+	resp_hash = resp_hash[ req_type ]
+
+	-- check for http method, eg 'POST'
 	if not resp_hash[ method ] then resp_hash[ method ] = {} end
 	resp_list = resp_hash[ method ]
 
-	resp_list[ url ] = response
+	item = {
+		url=url,
+		action=response
+	}
+	table.insert( resp_list, item )
 
 end
 
 
-function MockServer:addFilter( func )
-	-- print( "MockServer:addFilter", func  )
+-- convenience function
+--
+function MockServer:requestRespondWith( method, url, response )
+	-- print( "MockServer:requestRespondWith", method, url, response  )
+	self:respondWith( self.REQUEST, method, url, response )
+end
+-- convenience function
+--
+function MockServer:downloadRespondWith( method, url, response )
+	-- print( "MockServer:downloadRespondWith", method, url, response  )
+	self:respondWith( self.DOWNLOAD, method, url, response )
+end
 
-	self._filter = func
+
+-- convenience function
+--
+function MockServer:addFilter( req_type, req_filter )
+	-- print( "MockServer:addFilter", req_type, req_filter  )
+	self._filter[ req_type ] = req_filter
+end
+
+
+-- convenience function
+--
+function MockServer:addRequestFilter( req_filter )
+	-- print( "MockServer:addRequestFilter", req_filter  )
+	self:addFilter( self.REQUEST, req_filter )
+end
+-- convenience function
+--
+function MockServer:addDownloadFilter( req_filter )
+	-- print( "MockServer:addDownloadFilter", req_filter  )
+	self:addFilter( self.DOWNLOAD, req_filter )
+end
+
+
+
+
+
+--====================================================================--
+--== Corona API Response Methods
+
+
+
+function MockServer:_request( url, method, callback, params )
+	-- print( "MockServer:_request", url, method, callback, params )
+
+	if not self:_mockHandlesRequestResponse( url, method, params ) then
+		return network.request( url, method, callback, params )
+
+	else
+		f = function()
+			return self:_doRequestResponse( url, method, callback, params )
+		end
+		timer.performWithDelay( self._request_delay, f )
+
+	end
+
+end
+
+function MockServer:_download( url, method, callback, params, filename, base_dir )
+	-- print( "MockServer:_download", url, method, callback, params, filename, base_dir )
+
+	if not self:_mockHandlesDownloadResponse( url, method, params ) then
+		return network.request( url, method, callback, params, filename, base_dir )
+
+	else
+		f = function()
+			return self:_doDownloadResponse( url, method, callback, params, filename, base_dir )
+		end
+		timer.performWithDelay( self._request_delay, f )
+
+	end
 
 end
 
 
-function MockServer:_findResponse( url, method )
-	-- print( "MockServer:_findResponse", url, method  )
 
-	local action_list = self._actions[ method ]
-	local action = nil
-	local response = nil
+--====================================================================--
+--== Private Methods
 
-	for k,v in pairs( action_list ) do
 
-		if k == url then
-			action = v
+
+-- _mockHandlesRequest()
+-- test if we are to handle or pass on request
+--
+function MockServer:_mockHandlesResponse( req_type, url, method, params )
+	-- print( "MockServer:_mockHandlesResponse", req_type, url, method, params  )
+
+	local filter = self._filter[ req_type ]
+
+	if not filter then
+		return true
+	else
+		return filter( url, method, params )
+	end
+end
+
+function MockServer:_mockHandlesRequestResponse( url, method, params )
+	-- print( "MockServer:_mockHandlesRequestResponse", url, method, params  )
+	return self:_mockHandlesResponse( self.REQUEST, url, method, params )
+end
+function MockServer:_mockHandlesDownloadResponse( url, method, params )
+	-- print( "MockServer:_mockHandlesDownloadResponse", url, method, params  )
+	return self:_mockHandlesResponse( self.DOWNLOAD, url, method, params )
+end
+
+
+
+
+function MockServer:_findAction( req_type, url, method )
+	-- print( "MockServer:_findAction", req_type, url, method  )
+
+	local url_parts = urllib.parse( url )
+
+	local resp_hash, resp_list
+	local action, response
+
+	if not url or not url_parts then return response end
+
+
+	resp_hash = self._actions[ req_type ]
+	if not resp_hash then error( "there are no responses for "..tostring(req_type), 2 ) end
+	resp_list = resp_hash[ method ]
+	if not resp_list then error( "there are no items for "..tostring(method), 2 ) end
+
+	-- Utils.print( url_parts )
+
+	for i,v in ipairs( resp_list ) do
+		local reg_exp = v.url
+		local action = v.action
+
+		-- print( "COMPARE: ", reg_exp, url_parts.path )
+		if string.match( url_parts.path, reg_exp ) then
+			-- print( "FOUDN ACTION!!!!" )
+			response = action
 			break
 		end
 
 	end
 
-	-- add data, event
-	if action then
-
-
-		local path = table.concat( { self._base_path, action[3] }, '/' )
-		local file_path = system.pathForFile( path, system.ResourceDirectory )
-
-		local data = Files.readJSONFile( file_path )
-		local json_data = json.encode( data )
-
-		-- todo, change depending on json, html
-
-		response = {}
-
-		response.event = {
-			name='networkRequest',
-			phase='ended',
-
-			responseType='text',
-			responseHeaders=action[2],
-			url=url,
-			bytesTransferred=#json_data,
-
-			status=action[1], -- 200, etc
-			response=json_data, -- json encoded data
-			isError=false,
-
-			requestId='??',
-		}
-
-
-	end
-
-	return response
-
-end
-
-
-function MockServer:_mockHandlesRequest( url, method )
-
-	local response = true
-
-	if self._filter then
-		response = self._filter( url, method )
-	end
-
 	return response
 end
 
+function MockServer:_findRequestAction( url, method )
+	return self:_findAction( self.REQUEST, url, method )
+end
+function MockServer:_findDownloadAction( url, method )
+	return self:_findAction( self.DOWNLOAD, url, method )
+end
 
-function MockServer:_request( url, method, callback, params )
-	-- print( "MockServer:_request", url, method  )
 
-	local passthru = MockServer.PASSTHRU_HASH[ method ]
-	local f
 
-	if self:_mockHandlesRequest( url, method ) then
-		f = function()
-			self:_respond( url, method, callback, params )
-		end
-		timer.performWithDelay( self.REQUEST_DELAY, f )
+
+function MockServer:_doRequestResponse( url, method, callback, params )
+	-- print( "MockServer:_doRequestResponse", url, method, callback, params )
+
+	local action, data, event
+
+	--== Create HTTP response with Corona Event
+
+	event = {
+		isError=false,
+
+		name='networkRequest',
+		phase='ended',
+
+		responseType='text',
+
+		responseHeaders=nil,
+		url=url,
+		bytesTransferred=0,
+
+		status=nil, -- 200, etc
+		response=data, -- json encoded data
+
+		requestId='??',
+	}
+
+	--== Check our setup
+
+
+	action = self:_findRequestAction( url, method )
+
+	if not action then
+		event.isError = true
+		event.status = 500
+		print( "Mock Server: couldn't find action for '"..tostring( url ).."'", 2 )
 
 	else
-		-- do real call
-		return self._network.request( url, method, callback, params )
+
+		local resp_status, resp_headers, resp_func = unpack( action )
+		-- print( resp_status, resp_headers, resp_func  )
+
+		data = resp_func( url, method, params, resp_status, resp_headers )
+
+		event.status = resp_status
+		event.responseHeaders = resp_headers
+
+		--== Create HTTP response with Corona Event
+
+		if not data then
+			event.isError = true
+			event.bytesTransferred=0
+			event.response=nil
+
+		else
+			event.isError = false
+			event.bytesTransferred=#data
+			event.response=data
+
+		end
 	end
+
+	if callback then callback( event ) end
 
 end
 
 
 
 
-return MockServer
+function MockServer:_doDownloadResponse( url, method, callback, params, filename, base_dir )
+	-- print( "MockServer:_doDownloadResponse", url, method, callback, params, filename, base_dir )
+
+	local action, success, event
+
+	--== Create HTTP response with Corona Event
+
+	event = {
+		name='networkRequest',
+		phase='ended',
+
+		isError=nil,
+		status=nil, -- 200, etc
+
+		filename=filename,
+		baseDirectory=base_dir,
+	}
+
+	--== Check our setup
+
+	action = self:_findDownloadAction( url, method )
+
+	if not action then
+		event.isError = true
+		event.status = 500
+		print( "Mock Server: couldn't find action for '"..tostring( url ).."'", 2 )
+
+	else
+
+		local resp_status, resp_headers, resp_func = unpack( action )
+		-- print( resp_status, resp_headers, resp_func  )
+
+		success = resp_func( url, method, params, filename, base_dir, resp_status, resp_headers )
+
+		event.status = resp_status
+
+		if not success then
+			event.isError = true
+		else
+			event.isError = false
+		end
+
+	end
+
+
+	if callback then callback( event ) end
+
+end
+
+
+
+
+--====================================================================--
+-- Create Mock Server Singleton
+--====================================================================--
+
+
+MockSingleton = MockServer:new()
+
+
+return MockSingleton
